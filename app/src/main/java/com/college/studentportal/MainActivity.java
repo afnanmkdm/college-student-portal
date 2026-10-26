@@ -8,7 +8,6 @@ import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.text.InputType;
-import android.view.Gravity;
 import android.view.View;
 import android.widget.*;
 
@@ -16,6 +15,22 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.security.MessageDigest;
+import java.util.concurrent.Executor;
+
+import androidx.credentials.Credential;
+import androidx.credentials.CredentialManager;
+import androidx.credentials.CredentialManagerCallback;
+import androidx.credentials.CustomCredential;
+import androidx.credentials.GetCredentialRequest;
+import androidx.credentials.GetCredentialResponse;
+import androidx.credentials.exceptions.GetCredentialException;
+
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption;
+import com.google.android.libraries.identity.googleid.GoogleIdTokenCredential;
+import com.google.firebase.auth.AuthCredential;
+import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.auth.GoogleAuthProvider;
 
 public class MainActivity extends Activity {
 
@@ -29,11 +44,19 @@ public class MainActivity extends Activity {
     private String email = "";
     private LinearLayout root;
 
+    private FirebaseAuth firebaseAuth;
+    private CredentialManager credentialManager;
+    private boolean googleSignInInProgress = false;
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
 
         prefs = getSharedPreferences("CampusData", MODE_PRIVATE);
+
+        firebaseAuth = FirebaseAuth.getInstance();
+        credentialManager = CredentialManager.create(this);
+
         email = prefs.getString("session", "");
 
         if (email.isEmpty()) {
@@ -146,6 +169,178 @@ public class MainActivity extends Activity {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
 
+    // ---------------- GOOGLE SIGN-IN ----------------
+
+    private void signInWithGoogle() {
+        if (googleSignInInProgress) {
+            return;
+        }
+
+        googleSignInInProgress = true;
+
+        try {
+            String webClientId =
+                    getString(R.string.default_web_client_id);
+
+            GetGoogleIdOption googleIdOption =
+                    new GetGoogleIdOption.Builder()
+                            .setFilterByAuthorizedAccounts(false)
+                            .setServerClientId(webClientId)
+                            .setAutoSelectEnabled(false)
+                            .build();
+
+            GetCredentialRequest request =
+                    new GetCredentialRequest.Builder()
+                            .addCredentialOption(googleIdOption)
+                            .build();
+
+            credentialManager.getCredentialAsync(
+                    this,
+                    request,
+                    null,
+                    getMainExecutor(),
+                    new CredentialManagerCallback<
+                            GetCredentialResponse,
+                            GetCredentialException>() {
+
+                        @Override
+                        public void onResult(
+                                GetCredentialResponse response) {
+                            handleGoogleCredential(response);
+                        }
+
+                        @Override
+                        public void onError(
+                                GetCredentialException exception) {
+                            googleSignInInProgress = false;
+                            msg("Google sign-in cancelled or failed: "
+                                    + exception.getMessage());
+                        }
+                    });
+
+        } catch (Exception ex) {
+            googleSignInInProgress = false;
+            msg("Google sign-in setup error: " + ex.getMessage());
+        }
+    }
+
+    private void handleGoogleCredential(
+            GetCredentialResponse response) {
+
+        Credential credential = response.getCredential();
+
+        if (!(credential instanceof CustomCredential)) {
+            googleSignInInProgress = false;
+            msg("Unsupported sign-in credential.");
+            return;
+        }
+
+        CustomCredential customCredential =
+                (CustomCredential) credential;
+
+        if (!GoogleIdTokenCredential.TYPE_GOOGLE_ID_TOKEN_CREDENTIAL
+                .equals(customCredential.getType())) {
+            googleSignInInProgress = false;
+            msg("Google account credential was not received.");
+            return;
+        }
+
+        try {
+            GoogleIdTokenCredential googleCredential =
+                    GoogleIdTokenCredential.createFrom(
+                            customCredential.getData());
+
+            String idToken = googleCredential.getIdToken();
+
+            AuthCredential firebaseCredential =
+                    GoogleAuthProvider.getCredential(idToken, null);
+
+            firebaseAuth.signInWithCredential(firebaseCredential)
+                    .addOnCompleteListener(this, task -> {
+                        googleSignInInProgress = false;
+
+                        if (!task.isSuccessful()) {
+                            String error = task.getException() != null
+                                    ? task.getException().getMessage()
+                                    : "Unknown authentication error";
+
+                            msg("Firebase sign-in failed: " + error);
+                            return;
+                        }
+
+                        FirebaseUser user =
+                                firebaseAuth.getCurrentUser();
+
+                        if (user == null || user.getEmail() == null) {
+                            msg("Google account email was not received.");
+                            firebaseAuth.signOut();
+                            return;
+                        }
+
+                        completeGoogleLogin(user);
+                    });
+
+        } catch (Exception ex) {
+            googleSignInInProgress = false;
+            msg("Could not read Google account: "
+                    + ex.getMessage());
+        }
+    }
+
+    private void completeGoogleLogin(FirebaseUser user) {
+        String userEmail = user.getEmail();
+
+        if (userEmail == null || userEmail.trim().isEmpty()) {
+            msg("Your Google account has no usable email address.");
+            firebaseAuth.signOut();
+            return;
+        }
+
+        email = userEmail.trim().toLowerCase();
+
+        String accountKey = "account_" + email;
+        String savedAccount = prefs.getString(accountKey, "");
+
+        try {
+            if (savedAccount.isEmpty()) {
+                JSONObject a = new JSONObject();
+
+                String displayName = user.getDisplayName();
+
+                a.put("name",
+                        displayName == null ? "Student" : displayName);
+                a.put("password", "");
+                a.put("studentId", "");
+                a.put("phone", "");
+                a.put("course", "");
+                a.put("year", "");
+                a.put("loginMethod", "google");
+
+                prefs.edit()
+                        .putString(accountKey, a.toString())
+                        .putString("session", email)
+                        .apply();
+
+                msg("Google account connected.");
+                showProfile();
+
+            } else {
+                // Preserve any profile and records already saved locally.
+                prefs.edit()
+                        .putString("session", email)
+                        .apply();
+
+                msg("Google sign-in successful.");
+                showHome();
+            }
+
+        } catch (Exception ex) {
+            msg("Could not create the local profile.");
+        }
+    }
+
+    // ---------------- LOGIN ----------------
+
     private void showLogin() {
         base("Welcome back", "Sign in to your student portal");
 
@@ -188,10 +383,13 @@ public class MainActivity extends Activity {
             }
         });
 
+        button(root, "Continue with Google", this::signInWithGoogle);
+
         button(root, "Create Student Account", this::showRegister);
 
         TextView note = text(
-                "Google sign-in and SMS OTP require authentication setup.",
+                "Google sign-in requires Firebase configuration. " +
+                "Local email/password accounts are stored on this device.",
                 12, muted, false);
         note.setPadding(0, 15, 0, 0);
         root.addView(note);
@@ -243,6 +441,7 @@ public class MainActivity extends Activity {
                 a.put("phone", "");
                 a.put("course", "");
                 a.put("year", "");
+                a.put("loginMethod", "local");
 
                 prefs.edit()
                         .putString("account_" + e, a.toString())
@@ -274,6 +473,8 @@ public class MainActivity extends Activity {
                 .putString("account_" + email, a.toString())
                 .apply();
     }
+
+    // ---------------- HOME DASHBOARD ----------------
 
     private void showHome() {
         JSONObject a = account();
@@ -318,12 +519,17 @@ public class MainActivity extends Activity {
 
         button(root, "Sign Out", () -> {
             prefs.edit().remove("session").apply();
+
+            // End the Firebase session too.
+            firebaseAuth.signOut();
+
             email = "";
             showLogin();
         });
 
         root.addView(text(
-                "Local prototype: data is stored on this device.",
+                "Local prototype: profile and records are stored on this device. " +
+                "Google authentication uses Firebase.",
                 12, muted, false));
     }
 
@@ -346,6 +552,8 @@ public class MainActivity extends Activity {
         p.setMargins(0, 0, 0, 10);
         root.addView(card, p);
     }
+
+    // ---------------- PROFILE ----------------
 
     private void showProfile() {
         JSONObject a = account();
@@ -395,6 +603,8 @@ public class MainActivity extends Activity {
 
         button(root, "Back to Home", this::showHome);
     }
+
+    // ---------------- RECORDS ----------------
 
     private String dataKey(String type) {
         return "data_" + email + "_" + type;
@@ -582,6 +792,8 @@ public class MainActivity extends Activity {
                 })
                 .show();
     }
+
+    // ---------------- CERTIFICATE VERIFICATION ----------------
 
     private void verifyCertificate() {
         base("Certificate Verification",
