@@ -28,6 +28,13 @@ jobs:
         with:
           gradle-version: '8.9'
 
+      # Restore the same debug signing key on later builds.
+      - name: Cache debug signing key
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: college-student-portal-debug-key-v1
+
       - name: Prepare debug signing key
         run: |
           mkdir -p "$HOME/.android"
